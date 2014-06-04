@@ -2,13 +2,17 @@ package s3gof3r
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 type getTest struct {
@@ -24,17 +28,16 @@ var getTests = []getTest{
 }
 
 func TestGetReader(t *testing.T) {
+	t.Parallel()
 	b, err := testBucket()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, tt := range getTests {
 		r, h, err := b.GetReader(tt.path, tt.config)
-		if !errorMatch(err, tt.err) {
-			t.Errorf("GetReader called with %v\n Expected: %v\n Actual:   %v\n", tt, tt.err, err)
-		}
 		if err != nil {
-			break
+			errComp(tt.err, err, t, tt)
+			continue
 		}
 		t.Logf("headers %v\n", h)
 		w := ioutil.Discard
@@ -48,9 +51,7 @@ func TestGetReader(t *testing.T) {
 
 		}
 		err = r.Close()
-		if err != nil {
-			t.Error(err)
-		}
+		errComp(tt.err, err, t, tt)
 
 	}
 }
@@ -68,30 +69,27 @@ var putTests = []putTest{
 	{"testfile", []byte("test_data"), nil, nil, 9, nil},
 	{"", []byte("test_data"), nil, nil,
 		9, &respError{StatusCode: 400, Message: "A key must be specified"}},
-	{"testfile", []byte(""), nil, nil, 1, nil}, //bug?
-	{"testfile", []byte("foo"), correct_header(), nil, 3, nil},
-}
-
-func correct_header() http.Header {
-	header := make(http.Header)
-	header.Add("x-amz-server-side-encryption", "AES256")
-	header.Add("x-amz-meta-foometadata", "testmeta")
-
-	return header
+	{"testempty", []byte(""), nil, nil, 0, errors.New("0 bytes written")},
+	{"testhg", []byte("foo"), goodHeader(), nil, 3, nil},
+	{"testhb", []byte("foo"), badHeader(), nil, 3,
+		&respError{StatusCode: 400, Message: "The Encryption request you specified is not valid. Supported value: AES256."}},
+	{"nomd5", []byte("foo"), goodHeader(),
+		&Config{Concurrency: 1, PartSize: 5 * mb, NTry: 1, Md5Check: false, Scheme: "http", Client: http.DefaultClient}, 3, nil},
+	{"noconc", []byte("foo"), nil,
+		&Config{Concurrency: 0, PartSize: 5 * mb, NTry: 1, Md5Check: true, Scheme: "https", Client: ClientWithTimeout(5 * time.Second)}, 3, nil},
 }
 
 func TestPutWriter(t *testing.T) {
+	t.Parallel()
 	b, err := testBucket()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, tt := range putTests {
 		w, err := b.PutWriter(tt.path, tt.header, tt.config)
-		if !errorMatch(err, tt.err) {
-			t.Errorf("PutWriter called with %v\n Expected: %v\n Actual:   %v\n", tt, tt.err, err)
-		}
 		if err != nil {
-			break
+			errComp(tt.err, err, t, tt)
+			continue
 		}
 		r := bytes.NewReader(tt.data)
 
@@ -104,10 +102,60 @@ func TestPutWriter(t *testing.T) {
 
 		}
 		err = w.Close()
+		errComp(tt.err, err, t, tt)
+	}
+}
+
+type putMultiTest struct {
+	path   string
+	data   io.Reader
+	header http.Header
+	config *Config
+	wSize  int64
+	err    error
+}
+
+var putMultiTests = []putMultiTest{
+	{"5mb_test.test", &randSrc{Size: int(5 * mb)}, goodHeader(), nil, 5 * mb, nil},
+	{"20mb_test.test", &randSrc{Size: int(20 * mb)}, goodHeader(),
+		&Config{Concurrency: 1, PartSize: 5 * mb, NTry: 2, Md5Check: true, Scheme: "https",
+			Client: ClientWithTimeout(5 * time.Second)}, 20 * mb, nil},
+	{"timeout.test", &randSrc{Size: int(5 * mb)}, goodHeader(),
+		&Config{Concurrency: 1, PartSize: 5 * mb, NTry: 1, Md5Check: false, Scheme: "https",
+			Client: ClientWithTimeout(1 * time.Millisecond)}, 5 * mb,
+		errors.New("timeout")},
+	{"timeout.test", &randSrc{Size: int(10 * mb)}, goodHeader(),
+		&Config{Concurrency: 1, PartSize: 5 * mb, NTry: 1, Md5Check: true, Scheme: "https",
+			Client: ClientWithTimeout(100 * time.Millisecond)}, 10 * mb,
+		errors.New("timeout")},
+	{"smallpart", &randSrc{Size: int(10 * mb)}, goodHeader(),
+		&Config{Concurrency: 4, PartSize: 4 * mb, NTry: 1, Md5Check: false, Scheme: "https",
+			Client: http.DefaultClient}, 10 * mb, nil},
+}
+
+func TestPutMulti(t *testing.T) {
+	t.Parallel()
+	b, err := testBucket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetLogger(os.Stderr, "test: ", (log.LstdFlags | log.Lshortfile), true)
+	for _, tt := range putMultiTests {
+		w, err := b.PutWriter(tt.path, tt.header, tt.config)
+		if err != nil {
+			errComp(tt.err, err, t, tt)
+			continue
+		}
+		n, err := io.Copy(w, tt.data)
 		if err != nil {
 			t.Error(err)
 		}
+		if n != tt.wSize {
+			t.Errorf("Expected size: %d. Actual: %d", tt.wSize, n)
 
+		}
+		err = w.Close()
+		errComp(tt.err, err, t, tt)
 	}
 }
 
@@ -139,21 +187,52 @@ func testBucket() (*Bucket, error) {
 	}
 
 	return b, nil
-
 }
 
-func errorMatch(expect, actual error) bool {
+func errComp(expect, actual error, t *testing.T, tt interface{}) bool {
 
 	if expect == nil && actual == nil {
 		return true
 	}
 
 	if expect == nil || actual == nil {
+		t.Errorf("PutWriter called with %v\n Expected: %v\n Actual:   %v\n", tt, expect, actual)
 		return false
 	}
+	if !strings.Contains(actual.Error(), expect.Error()) {
+		t.Errorf("PutWriter called with %v\n Expected: %v\n Actual:   %v\n", tt, expect, actual)
+		return false
+	}
+	return true
 
-	return expect.Error() == actual.Error()
+}
 
+func goodHeader() http.Header {
+	header := make(http.Header)
+	header.Add("x-amz-server-side-encryption", "AES256")
+	header.Add("x-amz-meta-foometadata", "testmeta")
+	return header
+}
+
+func badHeader() http.Header {
+	header := make(http.Header)
+	header.Add("x-amz-server-side-encryption", "AES512")
+	return header
+}
+
+type randSrc struct {
+	Size  int
+	total int
+}
+
+func (r *randSrc) Read(p []byte) (int, error) {
+
+	n, err := rand.Read(p)
+	r.total = r.total + n
+	if r.total >= r.Size {
+		return n, io.EOF
+	}
+	return n, err
 }
 
 func ExampleBucket_PutWriter() error {
